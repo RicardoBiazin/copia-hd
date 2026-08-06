@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# logs de execucao e estado de retomada: contem numeros de serie de discos
+logs/
+
+# imagens de disco usadas em testes manuais
+*.img
