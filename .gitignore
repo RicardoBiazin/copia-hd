@@ -9,3 +9,16 @@ logs/
 
 # imagens de disco usadas em testes manuais
 *.img
+*.vhd
+*.vhdx
+*.iso
+
+# Segredos e configuracao local (repositorio publico)
+.env
+.env.*
+!.env.example
+credentials*.json
+*token*.json
+*.pem
+*.key
+*.pfx
