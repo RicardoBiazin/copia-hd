@@ -24,6 +24,8 @@ from .winio import (
 
 BLOCO_PADRAO = 4 * 1024 * 1024
 TENTATIVAS_LEITURA = 3
+BYTES_ENTRADAS_GPT = 128 * 128  # 128 entradas de 128 B, o padrao do Windows
+SETORES_TABELA_GPT = 34  # MBR protetiva + cabecalho primario + 32 setores de entradas
 
 
 class ErroClone(RuntimeError):
@@ -120,7 +122,25 @@ def montar_plano(
     a_copiar = bytes_origem
     if bytes_destino < bytes_origem:
         fim = origem.fim_ultima_particao
-        if not copiar_disco_inteiro and fim and fim <= bytes_destino:
+        # Em GPT o cabecalho secundario e a copia das entradas ficam no fim do
+        # destino, depois da ultima particao. Sem essa folga a correcao da GPT
+        # so falharia depois de horas de copia, deixando o disco sem tabela valida.
+        reserva_gpt = 0
+        if origem.estilo_particao.upper() == "GPT":
+            reserva_gpt = _arredondar_para_cima(BYTES_ENTRADAS_GPT, setor_origem) + setor_origem
+        if (
+            not copiar_disco_inteiro
+            and fim
+            and fim <= bytes_destino
+            and fim + reserva_gpt > bytes_destino
+        ):
+            raise ErroClone(
+                f"O destino ({formatar_bytes(bytes_destino)}) comporta as particoes "
+                f"({formatar_bytes(fim)}), mas nao sobra espaco para a GPT de backup "
+                f"({formatar_bytes(reserva_gpt)} no fim do disco). Use um destino "
+                "maior ou o comando 'arquivos' (copia por arquivos)."
+            )
+        if not copiar_disco_inteiro and fim and fim + reserva_gpt <= bytes_destino:
             modo = "ate-ultima-particao"
             a_copiar = _arredondar_para_cima(fim, setor_origem)
             avisos.append(
@@ -131,8 +151,8 @@ def montar_plano(
             raise ErroClone(
                 f"O destino ({formatar_bytes(bytes_destino)}) e menor que a origem "
                 f"({formatar_bytes(bytes_origem)}) e as particoes ocupam ate "
-                f"{formatar_bytes(fim)}. Use o modo de copia por arquivos "
-                "(--modo arquivos) para um destino menor."
+                f"{formatar_bytes(fim)}. Use o comando 'arquivos' "
+                "(copia por arquivos) para um destino menor."
             )
     elif bytes_destino > bytes_origem:
         avisos.append(
@@ -195,20 +215,38 @@ class EstadoRetomada:
         self.caminho.unlink(missing_ok=True)
 
 
-def preparar_destino(numero_disco: int, registrar=print) -> None:
-    """Desmonta e tranca os volumes do destino antes de sobrescrever."""
+def preparar_destino(numero_disco: int, registrar=print) -> list[DispositivoBruto]:
+    """Desmonta e tranca os volumes do destino antes de sobrescrever.
+
+    Devolve os handles dos volumes travados. O Windows solta a trava no instante
+    em que o handle fecha, entao quem chama precisa mante-los abertos durante a
+    copia inteira e depois chamar `soltar_travas`. Fechar o handle aqui deixaria o
+    volume livre para ser remontado no meio da copia (WriteFile falha com erro 5).
+    """
     from .disks import letras_do_disco
 
+    travas: list[DispositivoBruto] = []
     for letra in letras_do_disco(numero_disco):
         try:
-            with DispositivoBruto(caminho_volume(letra), escrita=True, sem_buffer=False) as vol:
-                travado = vol.travar_volume()
-                desmontado = vol.desmontar_volume()
-                registrar(
-                    f"  Volume {letra}: travado={travado} desmontado={desmontado}"
-                )
+            vol = DispositivoBruto(caminho_volume(letra), escrita=True, sem_buffer=False)
         except WinIOError as exc:
             registrar(f"  Aviso: nao foi possivel preparar {letra}: - {exc}")
+            continue
+        travado = vol.travar_volume()
+        desmontado = vol.desmontar_volume()
+        registrar(f"  Volume {letra}: travado={travado} desmontado={desmontado}")
+        if travado:
+            travas.append(vol)
+        else:
+            vol.fechar()
+            registrar(f"  Aviso: volume {letra} sem trava; ele pode ser remontado durante a copia.")
+    return travas
+
+
+def soltar_travas(travas: list[DispositivoBruto]) -> None:
+    """Fecha os handles de `preparar_destino`, liberando os volumes. Idempotente."""
+    while travas:
+        travas.pop().fechar()
 
 
 def executar_clone(
@@ -238,33 +276,43 @@ def executar_clone(
     ultimo_relato = 0.0
     ultimo_estado = time.monotonic()
 
-    with DispositivoBruto(caminho_disco(plano.origem.numero)) as origem, DispositivoBruto(
-        caminho_disco(plano.destino.numero), escrita=True
-    ) as destino:
-        offset = inicio_offset
-        while offset < plano.bytes_a_copiar:
-            tamanho = _arredondar_para_cima(
-                min(plano.bloco, plano.bytes_a_copiar - offset), plano.setor
-            )
-            zerados = _ler_bloco(
-                origem, offset, tamanho, plano.setor, buffer, setores_ruins, registrar
-            )
-            progresso.bytes_zerados += zerados
-            destino.posicionar(offset)
-            destino.escrever_de(buffer, tamanho)
+    offset = inicio_offset
+    try:
+        with DispositivoBruto(caminho_disco(plano.origem.numero)) as origem, DispositivoBruto(
+            caminho_disco(plano.destino.numero), escrita=True
+        ) as destino:
+            while offset < plano.bytes_a_copiar:
+                tamanho = _arredondar_para_cima(
+                    min(plano.bloco, plano.bytes_a_copiar - offset), plano.setor
+                )
+                zerados = _ler_bloco(
+                    origem, offset, tamanho, plano.setor, buffer, setores_ruins, registrar
+                )
+                progresso.bytes_zerados += zerados
+                destino.posicionar(offset)
+                destino.escrever_de(buffer, tamanho)
 
-            offset += tamanho
-            progresso.copiados = min(offset, plano.bytes_a_copiar)
-            progresso.setores_ruins = len(setores_ruins)
+                offset += tamanho
+                progresso.copiados = min(offset, plano.bytes_a_copiar)
+                progresso.setores_ruins = len(setores_ruins)
 
-            agora = time.monotonic()
-            if agora - ultimo_relato >= 0.5:
-                if aoprogresso:
-                    aoprogresso(progresso)
-                ultimo_relato = agora
-            if estado and agora - ultimo_estado >= 5:
+                agora = time.monotonic()
+                if agora - ultimo_relato >= 0.5:
+                    if aoprogresso:
+                        aoprogresso(progresso)
+                    ultimo_relato = agora
+                if estado and agora - ultimo_estado >= 5:
+                    estado.salvar(assinatura, offset, setores_ruins)
+                    ultimo_estado = agora
+    except BaseException:
+        # Ctrl+C ou erro de I/O: grava o ponto exato para a retomada. `offset` so
+        # avanca depois que o bloco foi escrito, entao nada fica pela metade.
+        if estado and offset > inicio_offset:
+            try:
                 estado.salvar(assinatura, offset, setores_ruins)
-                ultimo_estado = agora
+            except OSError:
+                pass
+        raise
 
     if aoprogresso:
         aoprogresso(progresso)
@@ -328,22 +376,29 @@ def verificar_copia(
     plano: PlanoClone,
     amostras: int = 64,
     registrar=print,
+    pular_tabela: bool = False,
 ) -> tuple[bool, list[int]]:
-    """Compara blocos por amostragem entre origem e destino."""
+    """Compara blocos por amostragem entre origem e destino.
+
+    Rode logo depois da copia, antes de ajustar a GPT: a correcao reescreve os
+    primeiros setores do destino (MBR protetiva, cabecalho, entradas) e eles
+    deixam de ser iguais aos da origem. Para conferir um disco que ja foi
+    ajustado, use `pular_tabela=True`, que comeca a amostragem depois da tabela.
+    """
     import hashlib
     import random
 
     divergentes: list[int] = []
     tamanho_amostra = _arredondar_para_cima(1 * 1024 * 1024, plano.setor)
-    posicoes = [0]
-    if plano.bytes_a_copiar > tamanho_amostra:
+    inicio = SETORES_TABELA_GPT * plano.setor if pular_tabela else 0
+    ultimo = plano.bytes_a_copiar - tamanho_amostra
+    posicoes = [inicio]
+    if ultimo > inicio:
         aleatorio = random.Random(1234)
         for _ in range(max(0, amostras - 2)):
-            limite = plano.bytes_a_copiar - tamanho_amostra
-            posicoes.append(_arredondar_para_cima(aleatorio.randrange(limite), plano.setor))
-        posicoes.append(
-            _arredondar_para_cima(plano.bytes_a_copiar - tamanho_amostra, plano.setor)
-        )
+            pos = aleatorio.randrange(inicio, ultimo)
+            posicoes.append(pos - pos % plano.setor)
+        posicoes.append(ultimo)
 
     with DispositivoBruto(caminho_disco(plano.origem.numero)) as origem, DispositivoBruto(
         caminho_disco(plano.destino.numero)

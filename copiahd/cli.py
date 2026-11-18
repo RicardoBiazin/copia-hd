@@ -38,8 +38,10 @@ from .rawclone import (
     executar_clone,
     montar_plano,
     preparar_destino,
+    soltar_travas,
     verificar_copia,
 )
+from .winio import WinIOError
 
 PASTA_LOGS = Path(__file__).resolve().parent.parent / "logs"
 
@@ -151,42 +153,87 @@ def comando_clonar(args) -> int:
 
         registrar("")
         registrar("Preparando destino...")
-        preparar_destino(destino.numero, registrar)
-        if args.offline_destino:
-            try:
-                definir_estado_disco(destino.numero, online=False)
-                registrar(f"  Disco {destino.numero} colocado offline.")
-            except ErroInventario as exc:
-                registrar(f"  Aviso: nao foi possivel colocar offline - {exc}")
-
-        registrar("")
-        registrar("Copiando (Ctrl+C interrompe; o progresso e retomavel)...")
+        # Os handles travados precisam ficar abertos durante toda a copia: a trava
+        # some quando o handle fecha.
+        travas = preparar_destino(destino.numero, registrar)
+        offline = False
         estado = PASTA_LOGS / f"retomada_disco{origem.numero}_para{destino.numero}.json"
-        inicio = time.monotonic()
         try:
-            progresso = executar_clone(
-                plano,
-                registrar=registrar,
-                aoprogresso=_progresso_console,
-                arquivo_estado=estado,
-                retomar=not args.reiniciar,
-            )
-        except KeyboardInterrupt:
-            print()
-            registrar("Interrompido. Rode o mesmo comando para retomar de onde parou.")
-            return 130
-        print()
-        registrar(
-            f"Copia concluida: {formatar_bytes(progresso.copiados)} em "
-            f"{time.monotonic() - inicio:.0f}s "
-            f"(media {formatar_bytes(int(progresso.taxa))}/s)."
-        )
+            if args.offline_destino:
+                try:
+                    definir_estado_disco(destino.numero, online=False)
+                    offline = True
+                    registrar(f"  Disco {destino.numero} colocado offline.")
+                    # offline some com os volumes; a trava deixa de ser necessaria
+                    soltar_travas(travas)
+                except ErroInventario as exc:
+                    registrar(f"  Aviso: nao foi possivel colocar offline - {exc}")
+            if not offline:
+                if travas:
+                    registrar(f"  {len(travas)} volume(s) do destino mantidos travados durante a copia.")
+                else:
+                    registrar(
+                        "  AVISO: destino sem offline e sem volumes travados. Se o Windows "
+                        "remontar um volume durante a copia, a gravacao falha (erro 5)."
+                    )
 
-        if args.offline_destino:
+            registrar("")
+            registrar("Copiando (Ctrl+C interrompe; o progresso e retomavel)...")
+            inicio = time.monotonic()
+            try:
+                progresso = executar_clone(
+                    plano,
+                    registrar=registrar,
+                    aoprogresso=_progresso_console,
+                    arquivo_estado=estado,
+                    retomar=not args.reiniciar,
+                )
+            except KeyboardInterrupt:
+                print()
+                registrar("Interrompido. Rode o mesmo comando para retomar de onde parou.")
+                return 130
+            except WinIOError as exc:
+                print()
+                registrar(f"ERRO de I/O durante a copia: {exc}")
+                registrar(
+                    "O progresso foi salvo. Resolva a causa (cabo, volume remontado, "
+                    "disco em uso) e rode o mesmo comando para retomar de onde parou."
+                )
+                return 1
+            print()
+            registrar(
+                f"Copia concluida: {formatar_bytes(progresso.copiados)} em "
+                f"{time.monotonic() - inicio:.0f}s "
+                f"(media {formatar_bytes(int(progresso.taxa))}/s)."
+            )
+
+            # A verificacao vem antes de qualquer ajuste: a correcao da GPT reescreve
+            # os primeiros setores do destino, que entao deixam de ser iguais aos da
+            # origem e fariam a amostra 0 divergir sempre.
+            if not args.sem_verificar:
+                registrar("")
+                registrar("Verificando a copia por amostragem...")
+                ok, divergentes = verificar_copia(
+                    plano, amostras=args.amostras, registrar=registrar
+                )
+                registrar(
+                    "  Resultado: copia identica nas amostras."
+                    if ok
+                    else f"  Resultado: {len(divergentes)} amostra(s) divergente(s)!"
+                )
+        finally:
+            soltar_travas(travas)
+
+        if args.offline_destino and offline:
             try:
                 definir_estado_disco(destino.numero, online=True)
-            except ErroInventario:
-                pass
+            except ErroInventario as exc:
+                registrar(
+                    f"  Aviso: nao foi possivel recolocar o disco online - {exc}. "
+                    "Com identificadores preservados o Windows costuma manter o clone "
+                    "offline enquanto o HD antigo esta ligado (colisao de assinatura); "
+                    "desligue o antigo ou use --novo-guid."
+                )
 
         registrar("")
         registrar("Ajustes finais no HD novo:")
@@ -202,16 +249,6 @@ def comando_clonar(args) -> int:
             time.sleep(2)  # deixa o Windows reler a tabela de particao
             registrar(expandir_ultima_particao(destino.numero).linha())
 
-        if not args.sem_verificar:
-            registrar("")
-            registrar("Verificando a copia por amostragem...")
-            ok, divergentes = verificar_copia(plano, amostras=args.amostras, registrar=registrar)
-            registrar(
-                "  Resultado: copia identica nas amostras."
-                if ok
-                else f"  Resultado: {len(divergentes)} amostra(s) divergente(s)!"
-            )
-
         registrar("")
         registrar(conferir_arquivos_de_boot(destino.numero).linha())
         if args.chkdsk:
@@ -220,7 +257,7 @@ def comando_clonar(args) -> int:
         registrar(relatorio_final(destino.numero))
         registrar(f"Log salvo em: {registrar.arquivo}")
         return 0
-    except (ErroClone, ErroInventario) as exc:
+    except (ErroClone, ErroInventario, WinIOError) as exc:
         registrar(f"ERRO: {exc}")
         return 1
     finally:
@@ -295,7 +332,7 @@ def comando_arquivos(args) -> int:
         registrar(conferir_arquivos_de_boot(destino.numero).linha())
         registrar(relatorio_final(destino.numero))
         return 0
-    except (ErroCopiaArquivos, ErroInventario) as exc:
+    except (ErroCopiaArquivos, ErroInventario, WinIOError) as exc:
         registrar(f"ERRO: {exc}")
         return 1
     finally:
@@ -323,7 +360,8 @@ def comando_verificar(args) -> int:
     origem = obter_disco(args.origem)
     destino = obter_disco(args.destino)
     plano = montar_plano(origem, destino, copiar_disco_inteiro=not args.recortar)
-    ok, divergentes = verificar_copia(plano, amostras=args.amostras)
+    # o disco ja foi ajustado: a tabela de particao do destino difere da origem
+    ok, divergentes = verificar_copia(plano, amostras=args.amostras, pular_tabela=True)
     print("Copia identica nas amostras." if ok else f"{len(divergentes)} divergencia(s).")
     print(conferir_arquivos_de_boot(destino.numero).linha())
     return 0 if ok else 1
@@ -427,9 +465,10 @@ def construir_parser() -> argparse.ArgumentParser:
     )
     c.add_argument(
         "--offline-destino",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="coloca o disco destino offline durante a copia",
+        help="coloca o disco destino offline durante a copia (padrao; "
+        "--no-offline-destino mantem so as travas de volume)",
     )
     c.add_argument("--chkdsk", action="store_true", help="roda chkdsk nos volumes do destino")
     c.add_argument("--amostras", type=int, default=64, help="numero de amostras na verificacao")

@@ -1,6 +1,6 @@
 name: Release
 
-# A cada tag vX.Y.Z: valida (roda os 65 checks sobre imagens sinteticas) e publica
+# A cada tag vX.Y.Z: valida (roda os 86 checks sobre imagens sinteticas) e publica
 # um Release com as notas dos commits desde a tag anterior. Sem passo manual.
 on:
   push:

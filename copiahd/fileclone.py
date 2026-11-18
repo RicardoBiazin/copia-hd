@@ -122,8 +122,9 @@ def copiar_volume(
         "/MIR",  # espelha (inclui subpastas vazias e remove extras)
         "/COPYALL",  # dados, atributos, timestamps, ACL, owner, auditoria
         "/DCOPY:DAT",  # metadados das pastas
+        "/B",  # modo backup: le pastas protegidas (WindowsApps etc.) sem "acesso negado"
         "/SL",  # copia links simbolicos como links
-        "/XJ",  # nao segue junctions (evita loop infinito)
+        "/SJ",  # copia junctions como junctions (sem segui-las, evita loop infinito)
         "/R:2",
         "/W:2",
         f"/MT:{threads}",

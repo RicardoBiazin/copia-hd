@@ -605,6 +605,17 @@ def teste_validacoes_do_plano(_tmp: Path) -> None:
         checar(plano.bytes_a_copiar == 40 * GB, "volume copiado limitado ao fim da ultima particao")
         checar(any("menor" in a for a in plano.avisos), "avisa que o destino e menor")
 
+        # as particoes cabem, mas nao sobra espaco para a GPT de backup no fim
+        justa = disco(0, 100 * GB, fim_particao=50 * GB)
+        erro = erro_de(justa, disco(1, 50 * GB), copiar_disco_inteiro=False)
+        checar(
+            erro is not None and "GPT de backup" in erro,
+            "--recortar recusa quando nao sobra espaco para a GPT de backup",
+        )
+        com_folga = disco(0, 100 * GB, fim_particao=50 * GB - (1 << 20))
+        plano = rawclone.montar_plano(com_folga, disco(1, 50 * GB), copiar_disco_inteiro=False)
+        checar(plano.modo == "ate-ultima-particao", "com folga para a GPT de backup o recorte e aceito")
+
         geometria = {0: (512, 100 * GB), 1: (512, 200 * GB)}
         plano = rawclone.montar_plano(d0, disco(1, 200 * GB))
         checar(plano.modo == "completo" and plano.bytes_a_copiar == 100 * GB, "destino maior: copia tudo")
@@ -618,6 +629,199 @@ def teste_validacoes_do_plano(_tmp: Path) -> None:
         )
     finally:
         rawclone.DispositivoBruto = original
+
+
+def _disco_falso(numero: int):
+    from copiahd.disks import Disco
+
+    return Disco(
+        numero=numero,
+        modelo=f"DISCO{numero}",
+        serial=f"SN{numero}",
+        tamanho=0,
+        barramento="SATA",
+        estilo_particao="GPT",
+        status="Online",
+        somente_leitura=False,
+        tem_boot=False,
+        tem_sistema=False,
+    )
+
+
+def teste_verificacao_antes_do_ajuste(tmp: Path) -> None:
+    print("\n12. Verificacao por amostragem: antes e depois do ajuste da GPT")
+    from copiahd import rawclone
+    from copiahd.rawclone import PlanoClone
+
+    origem = tmp / "ver_origem.img"
+    destino = tmp / "ver_destino.img"
+    setores_o, setores_d = 40 * 1024, 100 * 1024
+    criar_imagem_gpt(origem, setores_o, [(TIPO_MS_BASIC, 34, setores_o - 40, "Windows")])
+    with open(destino, "wb") as f:
+        f.truncate(setores_d * SETOR)
+    clonar_arquivo(origem, destino)
+
+    plano = PlanoClone(
+        origem=_disco_falso(0),
+        destino=_disco_falso(1),
+        bytes_a_copiar=setores_o * SETOR,
+        setor=SETOR,
+        bloco=1 << 20,
+        modo="completo",
+    )
+    caminhos = {0: str(origem), 1: str(destino)}
+    original = rawclone.caminho_disco
+    rawclone.caminho_disco = lambda n: caminhos[n]
+    mudo = lambda *_: None  # noqa: E731
+    try:
+        ok, _ = rawclone.verificar_copia(plano, registrar=mudo)
+        checar(ok, "logo apos a copia (destino maior) a verificacao passa")
+
+        gpt.corrigir_gpt(str(destino))
+        ok, div = rawclone.verificar_copia(plano, registrar=mudo)
+        checar(not ok and 0 in div, "depois do ajuste a amostra 0 diverge (por isso a verificacao vem antes)")
+        ok, _ = rawclone.verificar_copia(plano, registrar=mudo, pular_tabela=True)
+        checar(ok, "com pular_tabela a verificacao de um disco ja ajustado passa")
+
+        with DispositivoBruto(str(destino), escrita=True) as d:
+            d.escrever(10 * 1024 * 1024, b"\xAA" * SETOR)
+        ok, div = rawclone.verificar_copia(plano, registrar=mudo, pular_tabela=True)
+        checar(not ok and len(div) >= 1, "corrupcao no meio do disco e detectada")
+    finally:
+        rawclone.caminho_disco = original
+
+
+def teste_robocopy_comando(tmp: Path) -> None:
+    print("\n13. Comando do robocopy (modo arquivos)")
+    from copiahd import fileclone
+
+    capturado: list[list[str]] = []
+
+    class Resultado:
+        returncode = 1
+
+    original = fileclone.subprocess.run
+
+    def falso(cmd, **_kw):
+        capturado.append(cmd)
+        return Resultado()
+
+    fileclone.subprocess.run = falso
+    try:
+        fileclone.copiar_volume("C:", "W:", tmp / "robo.log", simular=True, registrar=lambda *_: None)
+    finally:
+        fileclone.subprocess.run = original
+    cmd = capturado[0]
+    checar("/B" in cmd, "usa modo backup (/B): pastas protegidas nao dao acesso negado")
+    checar("/SJ" in cmd and "/XJ" not in cmd, "junctions copiadas como junctions (/SJ), nao descartadas")
+    checar("/L" in cmd, "simulacao usa /L (nenhuma escrita)")
+    checar("/MIR" in cmd and "/COPYALL" in cmd, "mantem espelhamento e todos os metadados")
+
+
+def teste_travas_do_destino(_tmp: Path) -> None:
+    print("\n14. Trava dos volumes do destino fica ativa durante a copia")
+    from copiahd import disks, rawclone
+
+    class Vol:
+        def __init__(self, caminho, escrita=False, sem_buffer=True):
+            self.caminho = caminho
+            self.fechado = False
+
+        def travar_volume(self):
+            return not self.caminho.endswith("E:")  # E: simula arquivo aberto
+
+        def desmontar_volume(self):
+            return True
+
+        def fechar(self):
+            self.fechado = True
+
+    original_disp = rawclone.DispositivoBruto
+    original_letras = disks.letras_do_disco
+    rawclone.DispositivoBruto = Vol
+    disks.letras_do_disco = lambda _n: ["D", "E"]
+    try:
+        travas = rawclone.preparar_destino(1, registrar=lambda *_: None)
+    finally:
+        rawclone.DispositivoBruto = original_disp
+        disks.letras_do_disco = original_letras
+    checar(len(travas) == 1 and travas[0].caminho.endswith("D:"), "so o volume travado fica retido")
+    checar(not travas[0].fechado, "handle do volume travado continua aberto apos preparar_destino")
+    retido = travas[0]
+    rawclone.soltar_travas(travas)
+    checar(retido.fechado and travas == [], "soltar_travas fecha o handle e esvazia a lista")
+    rawclone.soltar_travas(travas)
+    checar(True, "soltar_travas e idempotente")
+
+
+def teste_estado_salvo_em_erro(tmp: Path) -> None:
+    print("\n15. Erro de I/O no meio da copia grava o ponto exato de retomada")
+    import json
+
+    from copiahd import rawclone
+    from copiahd.rawclone import PlanoClone
+    from copiahd.winio import WinIOError
+
+    bloco, blocos = 64 * 1024, 4
+    origem, destino = tmp / "est_origem.img", tmp / "est_destino.img"
+    origem.write_bytes(os.urandom(bloco * blocos))
+    with open(destino, "wb") as f:
+        f.truncate(bloco * blocos)
+    estado = tmp / "est.json"
+    plano = PlanoClone(
+        origem=_disco_falso(0),
+        destino=_disco_falso(1),
+        bytes_a_copiar=bloco * blocos,
+        setor=SETOR,
+        bloco=bloco,
+        modo="completo",
+    )
+    caminhos = {0: str(origem), 1: str(destino)}
+    original_caminho = rawclone.caminho_disco
+    original_ler = rawclone._ler_bloco
+    chamadas = {"n": 0}
+
+    def ler_com_falha(*a, **kw):
+        chamadas["n"] += 1
+        if chamadas["n"] == 3:
+            raise WinIOError("ReadFile", 5)
+        return original_ler(*a, **kw)
+
+    rawclone.caminho_disco = lambda n: caminhos[n]
+    rawclone._ler_bloco = ler_com_falha
+    mudo = lambda *_: None  # noqa: E731
+    try:
+        levantou = False
+        try:
+            rawclone.executar_clone(plano, registrar=mudo, arquivo_estado=estado)
+        except WinIOError:
+            levantou = True
+        checar(levantou, "o erro de I/O chega a quem chamou (a CLI o trata)")
+        checar(estado.exists(), "arquivo de retomada gravado mesmo com a falha")
+        checar(
+            json.loads(estado.read_text(encoding="utf-8"))["offset"] == 2 * bloco,
+            "offset salvo = exatamente os 2 blocos ja escritos",
+        )
+
+        rawclone._ler_bloco = original_ler
+        rawclone.executar_clone(plano, registrar=mudo, arquivo_estado=estado)
+        checar(origem.read_bytes() == destino.read_bytes(), "retomada completa a copia, identica a origem")
+        checar(not estado.exists(), "estado de retomada removido ao concluir")
+    finally:
+        rawclone.caminho_disco = original_caminho
+        rawclone._ler_bloco = original_ler
+
+
+def teste_opcao_offline_destino(_tmp: Path) -> None:
+    print("\n16. Opcao --offline-destino pode ser desligada")
+    from copiahd import cli
+
+    p = cli.construir_parser()
+    checar(p.parse_args(["clonar", "0", "1"]).offline_destino is True, "padrao: destino offline")
+    checar(
+        p.parse_args(["clonar", "0", "1", "--no-offline-destino"]).offline_destino is False,
+        "--no-offline-destino desliga",
+    )
 
 
 def teste_arredondamento(_tmp: Path) -> None:
@@ -645,6 +849,11 @@ def main() -> int:
             teste_leitor_fat_particao_efi,
             teste_guid_preservado_por_padrao,
             teste_validacoes_do_plano,
+            teste_verificacao_antes_do_ajuste,
+            teste_robocopy_comando,
+            teste_travas_do_destino,
+            teste_estado_salvo_em_erro,
+            teste_opcao_offline_destino,
             teste_arredondamento,
         ):
             teste(tmp)

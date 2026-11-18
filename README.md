@@ -34,10 +34,13 @@ O destino é apagado por completo.
 
 1. **Validação** — recusa destino menor, destino que é o disco de sistema em uso,
    e discos com tamanho de setor diferente (512e vs 4Kn não geram sistema que dá boot).
-2. **Preparação** — desmonta e trava os volumes do destino, e o coloca offline.
+   Com `--recortar` (destino menor), exige folga no fim do disco para a GPT de backup.
+2. **Preparação** — desmonta e trava os volumes do destino e o coloca offline
+   (`--no-offline-destino` desliga o offline; as travas de volume ficam ativas
+   durante toda a cópia).
 3. **Cópia setor a setor** — blocos de 4 MB com I/O sem buffer, progresso com
-   velocidade e tempo restante. `Ctrl+C` interrompe e o mesmo comando **retoma**
-   de onde parou (estado em `logs/`).
+   velocidade e tempo restante. `Ctrl+C` ou um erro de I/O interrompem, gravam o
+   ponto exato e o mesmo comando **retoma** de onde parou (estado em `logs/`).
 4. **Setores defeituosos** — a leitura cai para setor a setor, tenta 3 vezes, e só
    então grava zeros no lugar, registrando a LBA. O clone continua em vez de abortar.
 5. **Correção da GPT** — depois de copiar para um disco de tamanho diferente, a GPT
@@ -46,8 +49,10 @@ O destino é apagado por completo.
    cópia das entradas no fim do disco novo, recalcula os CRC-32 e ajusta a MBR
    protetiva para cobrir o disco inteiro.
 6. **Expansão** — estende a partição de dados (o Windows) para o espaço extra.
-7. **Verificação** — compara 64 amostras de 1 MB entre origem e destino por SHA-256
-   e confere os arquivos de boot na partição EFI.
+7. **Verificação** — roda logo depois da cópia, antes de ajustar a GPT (o ajuste
+   reescreve os primeiros setores, que deixariam de ser iguais). Compara 64
+   amostras de 1 MB entre origem e destino por SHA-256 e confere os arquivos de
+   boot na partição EFI.
 
 ## Identificadores do disco: por que não são trocados por padrão
 
@@ -69,8 +74,11 @@ bcdboot C:\Windows /s S: /f UEFI
 ## Modo cópia por arquivos (`arquivos`)
 
 Para quando o HD novo é **menor** que o antigo. Particiona o destino do zero
-(EFI + MSR + NTFS), copia com `robocopy /MIR /COPYALL` preservando ACLs, donos,
+(EFI + MSR + NTFS), copia com `robocopy /MIR /COPYALL /B` preservando ACLs, donos,
 atributos e timestamps, e reconstrói o boot com `bcdboot`.
+
+Usa o modo backup (`/B`) para ler pastas protegidas e copia junctions como
+junctions (`/SJ`).
 
 Exclui o que o Windows recria sozinho: `pagefile.sys`, `swapfile.sys`,
 `hiberfil.sys`, `$RECYCLE.BIN`, `System Volume Information`.
@@ -112,7 +120,7 @@ e recrie a recuperação com `reagentc /enable`.
 python -m tests.test_copiahd
 ```
 
-65 verificações sobre imagens de disco sintéticas — GPT construída à mão, volume
+86 verificações sobre imagens de disco sintéticas — GPT construída à mão, volume
 FAT32 com nomes longos, simulação de setor defeituoso. Nenhum disco real é tocado.
 
 ## Estrutura
