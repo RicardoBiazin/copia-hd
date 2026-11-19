@@ -27,6 +27,10 @@ python app.py ajustar 1              # corrige GPT e expande partição de um cl
 python app.py verificar 0 1          # confere a cópia por amostragem
 ```
 
+`verificar` ignora a tabela de partição (que o ajuste reescreve). Rode-o antes de
+usar o HD novo: depois de montado e usado, o NTFS grava no volume e a comparação
+acusa divergências reais, mas esperadas.
+
 **Sempre rode `--simular` primeiro** e confirme que os números de disco estão certos.
 O destino é apagado por completo.
 
@@ -40,7 +44,11 @@ O destino é apagado por completo.
    durante toda a cópia).
 3. **Cópia setor a setor** — blocos de 4 MB com I/O sem buffer, progresso com
    velocidade e tempo restante. `Ctrl+C` ou um erro de I/O interrompem, gravam o
-   ponto exato e o mesmo comando **retoma** de onde parou (estado em `logs/`).
+   ponto exato e o mesmo comando **retoma** de onde parou (estado em `logs/`). O
+   destino continua **offline** de propósito, para o Windows não mexer na cópia
+   parcial; se desistir, volte-o com `Set-Disk -Number N -IsOffline $false`. Uma
+   cópia interrompida com `--no-offline-destino` **não** é retomada (o Windows pode
+   ter montado o clone parcial): recomeça do zero.
 4. **Setores defeituosos** — a leitura cai para setor a setor, tenta 3 vezes, e só
    então grava zeros no lugar, registrando a LBA. O clone continua em vez de abortar.
 5. **Correção da GPT** — depois de copiar para um disco de tamanho diferente, a GPT
@@ -128,7 +136,7 @@ e recrie a recuperação com `reagentc /enable`.
 python -m tests.test_copiahd
 ```
 
-105 verificações sobre imagens de disco sintéticas — GPT construída à mão, volume
+119 verificações sobre imagens de disco sintéticas — GPT construída à mão, volume
 FAT32 com nomes longos, simulação de setor defeituoso. Nenhum disco real é tocado.
 
 ## Estrutura

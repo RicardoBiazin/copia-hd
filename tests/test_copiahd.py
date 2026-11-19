@@ -1002,6 +1002,193 @@ def teste_assinatura_da_retomada(tmp: Path) -> None:
     checar(EstadoRetomada(tmp / "ass.json").carregar(outro) == 0, "assinatura diferente: recomeca do zero")
 
 
+def teste_retomada_sem_protecao(tmp: Path) -> None:
+    print("\n22. Copia interrompida sem destino offline nao e retomada")
+    from copiahd import rawclone
+    from copiahd.rawclone import EstadoRetomada, PlanoClone, assinatura_clone
+    from copiahd.winio import WinIOError
+
+    bloco, blocos = 64 * 1024, 4
+    origem, destino = tmp / "sp_origem.img", tmp / "sp_destino.img"
+    origem.write_bytes(os.urandom(bloco * blocos))
+    with open(destino, "wb") as f:
+        f.truncate(bloco * blocos)
+    plano = PlanoClone(_disco_falso(0), _disco_falso(1), bloco * blocos, SETOR, bloco, "completo")
+    caminhos = {0: str(origem), 1: str(destino)}
+    original_caminho = rawclone.caminho_disco
+    original_ler = rawclone._ler_bloco
+
+    def interrompe_no_terceiro():
+        chamadas = {"n": 0}
+
+        def ler(*a, **kw):
+            chamadas["n"] += 1
+            if chamadas["n"] == 3:
+                raise WinIOError("ReadFile", 5)
+            return original_ler(*a, **kw)
+
+        return ler
+
+    def roda(estado: Path, protegido: bool, falha: bool) -> list[str]:
+        mensagens: list[str] = []
+        rawclone._ler_bloco = interrompe_no_terceiro() if falha else original_ler
+        try:
+            rawclone.executar_clone(
+                plano, registrar=mensagens.append, arquivo_estado=estado, protegido=protegido
+            )
+        except WinIOError:
+            pass
+        return mensagens
+
+    rawclone.caminho_disco = lambda n: caminhos[n]
+    try:
+        # destino offline: a retomada continua de onde parou
+        est_ok = tmp / "sp_protegido.json"
+        roda(est_ok, protegido=True, falha=True)
+        mensagens = roda(est_ok, protegido=True, falha=False)
+        checar(any("Retomando" in m for m in mensagens), "protegido (offline): retoma do ponto salvo")
+
+        # destino exposto ao Windows: estado descartado, recomeca do zero
+        est_ruim = tmp / "sp_exposto.json"
+        roda(est_ruim, protegido=False, falha=True)
+        checar(not EstadoRetomada(est_ruim).carregar(assinatura_clone(plano)), "estado sem protecao vale 0")
+        mensagens = roda(est_ruim, protegido=False, falha=False)
+        checar(
+            any("Recomecando do zero" in m for m in mensagens) and not any("Retomando" in m for m in mensagens),
+            "sem protecao: avisa e recomeca do zero",
+        )
+        checar(origem.read_bytes() == destino.read_bytes(), "o recomeco termina com copia identica")
+
+        # estado antigo (sem o campo) continua valendo como protegido
+        antigo = tmp / "sp_antigo.json"
+        antigo.write_text(
+            '{"assinatura": %s, "offset": 4096, "setores_ruins": []}'
+            % __import__("json").dumps(assinatura_clone(plano)),
+            encoding="utf-8",
+        )
+        checar(EstadoRetomada(antigo).carregar(assinatura_clone(plano)) == 4096, "estado antigo sem o campo segue valendo")
+    finally:
+        rawclone.caminho_disco = original_caminho
+        rawclone._ler_bloco = original_ler
+
+
+def teste_preparar_destino_limpa_em_erro(_tmp: Path) -> None:
+    print("\n23. preparar_destino fecha os handles se falhar no meio")
+    from copiahd import disks, rawclone
+
+    abertos: list = []
+
+    class Vol:
+        def __init__(self, caminho, escrita=False, sem_buffer=True):
+            self.caminho = caminho
+            self.fechado = False
+            abertos.append(self)
+
+        def travar_volume(self):
+            if self.caminho.endswith("E:"):
+                raise RuntimeError("falha inesperada")
+            return True
+
+        def desmontar_volume(self):
+            return True
+
+        def fechar(self):
+            self.fechado = True
+
+    original_disp = rawclone.DispositivoBruto
+    original_letras = disks.letras_do_disco
+    rawclone.DispositivoBruto = Vol
+    disks.letras_do_disco = lambda _n: ["D", "E"]
+    try:
+        try:
+            rawclone.preparar_destino(1, registrar=lambda *_: None)
+            checar(False, "deveria propagar a falha")
+        except RuntimeError:
+            checar(True, "a falha chega a quem chamou")
+    finally:
+        rawclone.DispositivoBruto = original_disp
+        disks.letras_do_disco = original_letras
+    checar(len(abertos) == 2 and all(v.fechado for v in abertos), "os dois handles (o ja travado e o que falhou) foram fechados")
+
+
+def teste_cli_trata_erros_de_verificar_e_ajustar(_tmp: Path) -> None:
+    print("\n24. verificar e ajustar devolvem erro limpo, sem traceback")
+    from copiahd import cli
+    from copiahd.disks import ErroInventario
+    from copiahd.winio import WinIOError
+
+    nomes = ("eh_admin", "obter_disco", "ajustar_gpt_destino")
+    guardados = {n: getattr(cli, n) for n in nomes}
+    cli.eh_admin = lambda: True
+
+    def sem_disco(_n):
+        raise ErroInventario("Disco 9 nao encontrado.")
+
+    def falha_io(*_a, **_k):
+        raise WinIOError("Abrir disco", 5)
+
+    discos = {0: _disco_falso(0)}
+    try:
+        cli.obter_disco = sem_disco
+        args = cli.construir_parser().parse_args(["verificar", "0", "9"])
+        checar(cli.comando_verificar(args) == 1, "verificar: disco inexistente retorna 1")
+
+        cli.obter_disco = lambda n: discos[0]  # origem == destino -> ErroClone
+        args = cli.construir_parser().parse_args(["verificar", "0", "0"])
+        checar(cli.comando_verificar(args) == 1, "verificar: plano invalido (mesmo disco) retorna 1")
+
+        cli.ajustar_gpt_destino = falha_io
+        args = cli.construir_parser().parse_args(["ajustar", "1"])
+        checar(cli.comando_ajustar(args) == 1, "ajustar: erro de acesso ao disco retorna 1")
+    finally:
+        for n, v in guardados.items():
+            setattr(cli, n, v)
+
+
+def teste_aviso_de_disco_offline(tmp: Path) -> None:
+    print("\n25. Ao interromper, a CLI avisa que o destino ficou offline")
+    from copiahd import cli
+    from copiahd.rawclone import ErroClone, PlanoClone
+    from copiahd.winio import WinIOError
+
+    discos = {0: _disco_falso(0), 1: _disco_falso(1)}
+    plano = PlanoClone(discos[0], discos[1], 1000 * SETOR, SETOR, SETOR, "completo")
+    nomes = (
+        "eh_admin", "obter_disco", "montar_plano", "preparar_destino",
+        "definir_estado_disco", "executar_clone", "PASTA_LOGS",
+    )
+    guardados = {n: getattr(cli, n) for n in nomes}
+    cli.eh_admin = lambda: True
+    cli.obter_disco = lambda n: discos[n]
+    cli.montar_plano = lambda *a, **k: plano
+    cli.preparar_destino = lambda *a, **k: []
+    cli.definir_estado_disco = lambda *a, **k: None
+
+    def roda(excecao, rotulo: str, *extra: str) -> tuple[int, str]:
+        def executar(*_a, **_k):
+            raise excecao
+
+        cli.executar_clone = executar
+        cli.PASTA_LOGS = tmp / f"logs_off_{rotulo}"
+        args = cli.construir_parser().parse_args(["clonar", "0", "1", "--sim", *extra])
+        codigo = cli.comando_clonar(args)
+        texto = "".join(p.read_text(encoding="utf-8") for p in cli.PASTA_LOGS.glob("clone_*.log"))
+        return codigo, texto
+
+    try:
+        codigo, log = roda(KeyboardInterrupt(), "ctrlc")
+        checar(codigo == 130 and "OFFLINE" in log and "Set-Disk -Number 1 -IsOffline $false" in log, "Ctrl+C: avisa o offline e como desfazer")
+        codigo, log = roda(WinIOError("ReadFile", 5), "io")
+        checar(codigo == 1 and "OFFLINE" in log, "erro de I/O: avisa o offline")
+        codigo, log = roda(ErroClone("Gravacao incompleta"), "erroclone")
+        checar(codigo == 1 and "OFFLINE" in log, "ErroClone: avisa o offline")
+        codigo, log = roda(KeyboardInterrupt(), "semoffline", "--no-offline-destino")
+        checar(codigo == 130 and "OFFLINE" not in log, "sem --offline-destino nao ha aviso (disco nao foi tocado)")
+    finally:
+        for n, v in guardados.items():
+            setattr(cli, n, v)
+
+
 def teste_arredondamento(_tmp: Path) -> None:
     print("\n8. Arredondamento de tamanhos para multiplo de setor")
     checar(_arredondar_para_cima(1, 512) == 512, "1 B -> 512 B")
@@ -1037,6 +1224,10 @@ def main() -> int:
             teste_gpt_mantem_lba_das_entradas,
             teste_gravacao_incompleta,
             teste_assinatura_da_retomada,
+            teste_retomada_sem_protecao,
+            teste_preparar_destino_limpa_em_erro,
+            teste_cli_trata_erros_de_verificar_e_ajustar,
+            teste_aviso_de_disco_offline,
             teste_arredondamento,
         ):
             teste(tmp)

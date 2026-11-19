@@ -188,8 +188,19 @@ class EstadoRetomada:
     def __init__(self, caminho: Path):
         self.caminho = caminho
         self.dados: dict = {}
+        # True quando havia estado valido, mas ele foi descartado porque a copia
+        # anterior rodou com o destino exposto ao Windows (ver `carregar`)
+        self.descartado_sem_protecao = False
 
     def carregar(self, assinatura: dict) -> int:
+        """Devolve o offset a retomar, ou 0 para comecar do zero.
+
+        Se a copia anterior rodou sem o destino offline, o Windows pode ter
+        montado o clone parcial (que ja tem a GPT da origem) e gravado nele:
+        marca de volume sujo, logs do NTFS. A retomada nao recopia o trecho
+        que ja passou, entao esse estado nao e confiavel e e descartado.
+        Estados antigos, sem o campo, valem como protegidos (comportamento anterior).
+        """
         if not self.caminho.exists():
             return 0
         try:
@@ -198,13 +209,23 @@ class EstadoRetomada:
             return 0
         if dados.get("assinatura") != assinatura:
             return 0
+        if not dados.get("protegido", True):
+            self.descartado_sem_protecao = True
+            return 0
         self.dados = dados
         return int(dados.get("offset", 0))
 
-    def salvar(self, assinatura: dict, offset: int, setores_ruins: list[int]) -> None:
+    def salvar(
+        self,
+        assinatura: dict,
+        offset: int,
+        setores_ruins: list[int],
+        protegido: bool = True,
+    ) -> None:
         self.dados = {
             "assinatura": assinatura,
             "offset": offset,
+            "protegido": protegido,
             "setores_ruins": setores_ruins[-500:],
         }
         tmp = self.caminho.with_suffix(".tmp")
@@ -246,20 +267,31 @@ def preparar_destino(numero_disco: int, registrar=print) -> list[DispositivoBrut
     from .disks import letras_do_disco
 
     travas: list[DispositivoBruto] = []
-    for letra in letras_do_disco(numero_disco):
-        try:
-            vol = DispositivoBruto(caminho_volume(letra), escrita=True, sem_buffer=False)
-        except WinIOError as exc:
-            registrar(f"  Aviso: nao foi possivel preparar {letra}: - {exc}")
-            continue
-        travado = vol.travar_volume()
-        desmontado = vol.desmontar_volume()
-        registrar(f"  Volume {letra}: travado={travado} desmontado={desmontado}")
-        if travado:
-            travas.append(vol)
-        else:
-            vol.fechar()
-            registrar(f"  Aviso: volume {letra} sem trava; ele pode ser remontado durante a copia.")
+    try:
+        for letra in letras_do_disco(numero_disco):
+            try:
+                vol = DispositivoBruto(caminho_volume(letra), escrita=True, sem_buffer=False)
+            except WinIOError as exc:
+                registrar(f"  Aviso: nao foi possivel preparar {letra}: - {exc}")
+                continue
+            try:
+                travado = vol.travar_volume()
+                desmontado = vol.desmontar_volume()
+            except BaseException:
+                vol.fechar()
+                raise
+            registrar(f"  Volume {letra}: travado={travado} desmontado={desmontado}")
+            if travado:
+                travas.append(vol)
+            else:
+                vol.fechar()
+                registrar(
+                    f"  Aviso: volume {letra} sem trava; ele pode ser remontado durante a copia."
+                )
+    except BaseException:
+        # nao deixa handles abertos (e volumes travados) se algo falhar no meio
+        soltar_travas(travas)
+        raise
     return travas
 
 
@@ -275,11 +307,22 @@ def executar_clone(
     aoprogresso=None,
     arquivo_estado: Path | None = None,
     retomar: bool = True,
+    protegido: bool = True,
 ) -> Progresso:
-    """Copia os bytes da origem para o destino, bloco por bloco."""
+    """Copia os bytes da origem para o destino, bloco por bloco.
+
+    `protegido` diz se o destino esta offline (fora do alcance do Windows). Fica
+    gravado no estado de retomada: uma copia interrompida sem protecao nao e
+    retomada depois, porque o Windows pode ter alterado o trecho ja copiado.
+    """
     assinatura = assinatura_clone(plano)
     estado = EstadoRetomada(arquivo_estado) if arquivo_estado else None
     inicio_offset = estado.carregar(assinatura) if (estado and retomar) else 0
+    if estado and estado.descartado_sem_protecao:
+        registrar(
+            "A copia anterior rodou sem o destino offline: o Windows pode ter montado "
+            "o clone parcial e alterado blocos ja copiados. Recomecando do zero."
+        )
     if inicio_offset:
         registrar(
             f"Retomando clone a partir de {formatar_bytes(inicio_offset)} "
@@ -324,14 +367,14 @@ def executar_clone(
                         aoprogresso(progresso)
                     ultimo_relato = agora
                 if estado and agora - ultimo_estado >= 5:
-                    estado.salvar(assinatura, offset, setores_ruins)
+                    estado.salvar(assinatura, offset, setores_ruins, protegido)
                     ultimo_estado = agora
     except BaseException:
         # Ctrl+C ou erro de I/O: grava o ponto exato para a retomada. `offset` so
         # avanca depois que o bloco foi escrito, entao nada fica pela metade.
         if estado and offset > inicio_offset:
             try:
-                estado.salvar(assinatura, offset, setores_ruins)
+                estado.salvar(assinatura, offset, setores_ruins, protegido)
             except OSError:
                 pass
         raise

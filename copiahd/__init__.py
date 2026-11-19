@@ -1,5 +1,5 @@
 """Copia_hd - clonagem de HD para HD no Windows, deixando o disco novo funcional."""
 
-VERSAO = "1.0.2"
+VERSAO = "1.0.3"
 
 __all__ = ["VERSAO"]

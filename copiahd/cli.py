@@ -114,6 +114,7 @@ def comando_listar(_args) -> int:
 def comando_clonar(args) -> int:
     _exigir_admin()
     registrar = Registro(PASTA_LOGS / f"clone_{datetime.now():%Y%m%d_%H%M%S}.log")
+    offline = False  # True enquanto o disco destino esta offline por nossa causa
     try:
         origem = obter_disco(args.origem)
         destino = obter_disco(args.destino)
@@ -157,8 +158,7 @@ def comando_clonar(args) -> int:
         # Os handles travados precisam ficar abertos durante toda a copia: a trava
         # some quando o handle fecha.
         travas = preparar_destino(destino.numero, registrar)
-        offline = False
-        estado = PASTA_LOGS / f"retomada_disco{origem.numero}_para{destino.numero}.json"
+        estado =PASTA_LOGS / f"retomada_disco{origem.numero}_para{destino.numero}.json"
         try:
             if args.offline_destino:
                 try:
@@ -188,10 +188,12 @@ def comando_clonar(args) -> int:
                     aoprogresso=_progresso_console,
                     arquivo_estado=estado,
                     retomar=not args.reiniciar,
+                    protegido=offline,
                 )
             except KeyboardInterrupt:
                 print()
                 registrar("Interrompido. Rode o mesmo comando para retomar de onde parou.")
+                _avisar_offline(registrar, destino.numero, offline)
                 return 130
             except WinIOError as exc:
                 print()
@@ -200,6 +202,7 @@ def comando_clonar(args) -> int:
                     "O progresso foi salvo. Resolva a causa (cabo, volume remontado, "
                     "disco em uso) e rode o mesmo comando para retomar de onde parou."
                 )
+                _avisar_offline(registrar, destino.numero, offline)
                 return 1
             print()
             registrar(
@@ -228,6 +231,7 @@ def comando_clonar(args) -> int:
         if args.offline_destino and offline:
             try:
                 definir_estado_disco(destino.numero, online=True)
+                offline = False
             except ErroInventario as exc:
                 registrar(
                     f"  Aviso: nao foi possivel recolocar o disco online - {exc}. "
@@ -260,9 +264,21 @@ def comando_clonar(args) -> int:
         return 0
     except (ErroClone, ErroInventario, WinIOError) as exc:
         registrar(f"ERRO: {exc}")
+        _avisar_offline(registrar, args.destino, offline)
         return 1
     finally:
         registrar.fechar()
+
+
+def _avisar_offline(registrar, numero: int, offline: bool) -> None:
+    """Diz que o destino ficou offline: manter assim protege a copia parcial."""
+    if not offline:
+        return
+    registrar(
+        f"  O disco {numero} continua OFFLINE de proposito: protege a copia parcial "
+        "contra o Windows. A retomada o mantem assim. Se desistir do clone, volte-o "
+        f"com: Set-Disk -Number {numero} -IsOffline $false (PowerShell como administrador)."
+    )
 
 
 def comando_arquivos(args) -> int:
@@ -353,22 +369,30 @@ def _maior_volume(disco: Disco) -> str | None:
 
 def comando_ajustar(args) -> int:
     _exigir_admin()
-    print(ajustar_gpt_destino(args.disco, novo_guid=args.novo_guid, simular=args.simular).linha())
-    if not args.sem_expandir:
-        print(expandir_ultima_particao(args.disco, simular=args.simular).linha())
-    print(conferir_arquivos_de_boot(args.disco).linha())
+    try:
+        print(ajustar_gpt_destino(args.disco, novo_guid=args.novo_guid, simular=args.simular).linha())
+        if not args.sem_expandir:
+            print(expandir_ultima_particao(args.disco, simular=args.simular).linha())
+        print(conferir_arquivos_de_boot(args.disco).linha())
+    except (ErroClone, ErroInventario, WinIOError) as exc:
+        print(f"ERRO: {exc}")
+        return 1
     return 0
 
 
 def comando_verificar(args) -> int:
     _exigir_admin()
-    origem = obter_disco(args.origem)
-    destino = obter_disco(args.destino)
-    plano = montar_plano(origem, destino, copiar_disco_inteiro=not args.recortar)
-    # o disco ja foi ajustado: a tabela de particao do destino difere da origem
-    ok, divergentes = verificar_copia(plano, amostras=args.amostras, pular_tabela=True)
-    print("Copia identica nas amostras." if ok else f"{len(divergentes)} divergencia(s).")
-    print(conferir_arquivos_de_boot(destino.numero).linha())
+    try:
+        origem = obter_disco(args.origem)
+        destino = obter_disco(args.destino)
+        plano = montar_plano(origem, destino, copiar_disco_inteiro=not args.recortar)
+        # o disco ja foi ajustado: a tabela de particao do destino difere da origem
+        ok, divergentes = verificar_copia(plano, amostras=args.amostras, pular_tabela=True)
+        print("Copia identica nas amostras." if ok else f"{len(divergentes)} divergencia(s).")
+        print(conferir_arquivos_de_boot(destino.numero).linha())
+    except (ErroClone, ErroInventario, WinIOError) as exc:
+        print(f"ERRO: {exc}")
+        return 1
     return 0 if ok else 1
 
 
