@@ -174,6 +174,22 @@ def reconstruir_boot(
     return proc.stdout.strip()
 
 
+def validar_origem_uefi(origem: Disco) -> None:
+    """Recusa origem que nao e GPT/UEFI antes de qualquer escrita.
+
+    Este modo sempre cria o destino em GPT com particao EFI e reconstroi o boot
+    com `bcdboot /f UEFI`. Um Windows instalado em MBR/BIOS nao inicializa assim.
+    """
+    if (origem.estilo_particao or "").upper() != "GPT":
+        raise ErroCopiaArquivos(
+            f"A origem (disco {origem.numero}) usa particionamento "
+            f"{origem.estilo_particao or 'desconhecido'}, nao GPT/UEFI. O modo "
+            "'arquivos' so sabe criar um destino GPT/UEFI; um Windows em MBR/BIOS "
+            "nao inicializaria nele. Nada foi alterado no destino. Use o clone "
+            "setor a setor (comando 'clonar'), que preserva o formato original."
+        )
+
+
 def espaco_necessario(origem: Disco) -> int:
     return origem.espaco_usado
 

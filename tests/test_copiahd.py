@@ -824,6 +824,184 @@ def teste_opcao_offline_destino(_tmp: Path) -> None:
     )
 
 
+def teste_modo_arquivos_recusa_origem_mbr(tmp: Path) -> None:
+    print("\n17. Modo arquivos recusa origem MBR/BIOS antes de apagar o destino")
+    from dataclasses import replace
+
+    from copiahd import cli, fileclone
+
+    mbr = replace(_disco_falso(0), estilo_particao="MBR")
+    try:
+        fileclone.validar_origem_uefi(mbr)
+        checar(False, "deveria recusar origem MBR")
+    except fileclone.ErroCopiaArquivos as exc:
+        checar("MBR" in str(exc) and "Nada foi alterado" in str(exc), "origem MBR recusada com mensagem clara")
+    fileclone.validar_origem_uefi(_disco_falso(0))
+    checar(True, "origem GPT aceita")
+
+    # ponta a ponta pela CLI: nenhuma etapa que escreve pode ser chamada
+    chamadas: list[str] = []
+
+    def proibido(nome):
+        def f(*_a, **_k):
+            chamadas.append(nome)
+            raise AssertionError(nome)
+
+        return f
+
+    discos = {0: mbr, 1: _disco_falso(1)}
+    nomes = ("eh_admin", "obter_disco", "particionar_destino", "copiar_volume", "reconstruir_boot", "PASTA_LOGS")
+    guardados = {n: getattr(cli, n) for n in nomes}
+    cli.eh_admin = lambda: True
+    cli.obter_disco = lambda n: discos[n]
+    cli.particionar_destino = proibido("particionar_destino")
+    cli.copiar_volume = proibido("copiar_volume")
+    cli.reconstruir_boot = proibido("reconstruir_boot")
+    cli.PASTA_LOGS = tmp / "logs_mbr"
+    try:
+        for extra in ([], ["--simular"], ["--sim", "--ignorar-espaco"]):
+            args = cli.construir_parser().parse_args(["arquivos", "0", "1", *extra])
+            codigo = cli.comando_arquivos(args)
+            checar(codigo == 1 and not chamadas, f"CLI com origem MBR {extra}: retorna 1 sem escrever")
+    finally:
+        for n, v in guardados.items():
+            setattr(cli, n, v)
+
+
+def teste_ignorar_espaco_separado_de_sim(tmp: Path) -> None:
+    print("\n18. --sim so dispensa a confirmacao; --ignorar-espaco ignora a checagem de espaco")
+    from dataclasses import replace
+
+    from copiahd import cli
+    from copiahd.disks import Particao
+
+    GB = 1 << 30
+    cheia = Particao(1, 1 << 20, 10 * GB, "Basic", "C", "Windows", "NTFS", 0, 10 * GB)
+    origem = replace(_disco_falso(0), tamanho=20 * GB, particoes=[cheia])
+    destino = replace(_disco_falso(1), tamanho=1 * GB)
+    discos = {0: origem, 1: destino}
+
+    nomes = ("eh_admin", "obter_disco", "particionar_destino", "copiar_volume", "reconstruir_boot", "PASTA_LOGS")
+    guardados = {n: getattr(cli, n) for n in nomes}
+    cli.eh_admin = lambda: True
+    cli.obter_disco = lambda n: discos[n]
+    cli.particionar_destino = lambda *a, **k: "[teste] particionar"
+    cli.copiar_volume = lambda *a, **k: None
+    cli.reconstruir_boot = lambda *a, **k: "[teste] bcdboot"
+    cli.PASTA_LOGS = tmp / "logs_espaco"
+    try:
+
+        def roda(*extra):
+            return cli.comando_arquivos(cli.construir_parser().parse_args(["arquivos", "0", "1", *extra]))
+
+        checar(roda("--simular") == 1, "destino pequeno demais recusado")
+        checar(roda("--simular", "--sim") == 1, "--sim sozinho NAO ignora mais a checagem de espaco")
+        checar(roda("--simular", "--ignorar-espaco") == 0, "--ignorar-espaco segue mesmo com destino pequeno")
+    finally:
+        for n, v in guardados.items():
+            setattr(cli, n, v)
+
+
+def teste_gpt_mantem_lba_das_entradas(tmp: Path) -> None:
+    print("\n19. Cabecalho primario mantem a LBA das entradas de particao")
+    img = tmp / "lba_entradas.img"
+    setores = 40 * 1024
+    criar_imagem_gpt(img, setores, [(TIPO_MS_BASIC, 34, setores - 40, "Windows")])
+    # move as entradas primarias da LBA 2 para a LBA 4 (ainda antes da primeira LBA usavel)
+    with DispositivoBruto(str(img), escrita=True) as d:
+        cab = gpt.analisar_cabecalho(d.ler(SETOR, SETOR))
+        entradas = d.ler(2 * SETOR, cab.bytes_entradas)
+        d.escrever(2 * SETOR, bytes(len(entradas)))
+        d.escrever(4 * SETOR, entradas)
+        novo = gpt._montar_cabecalho(
+            cab, 1, cab.lba_alternativa, 4, cab.primeira_lba_usavel,
+            cab.ultima_lba_usavel, cab.guid_disco, cab.crc_entradas,
+        )
+        d.escrever(SETOR, novo.ljust(SETOR, b"\x00"))
+    gpt.corrigir_gpt(str(img))
+    with DispositivoBruto(str(img)) as d:
+        primario = gpt.analisar_cabecalho(d.ler(SETOR, SETOR))
+    checar(primario is not None and primario.lba_entradas == 4, "primario continua apontando para a LBA 4")
+    checar(
+        [p["nome"] for p in gpt.descrever_particoes(str(img))] == ["Windows"],
+        "particoes legiveis a partir de onde o cabecalho aponta",
+    )
+
+
+def teste_gravacao_incompleta(tmp: Path) -> None:
+    print("\n20. Gravacao parcial e detectada e o ponto de retomada e salvo")
+    import json
+
+    from copiahd import rawclone
+    from copiahd.rawclone import ErroClone, PlanoClone
+
+    bloco, blocos = 64 * 1024, 4
+    origem, destino = tmp / "gr_origem.img", tmp / "gr_destino.img"
+    origem.write_bytes(os.urandom(bloco * blocos))
+    with open(destino, "wb") as f:
+        f.truncate(bloco * blocos)
+    estado = tmp / "gr.json"
+    plano = PlanoClone(_disco_falso(0), _disco_falso(1), bloco * blocos, SETOR, bloco, "completo")
+    caminhos = {0: str(origem), 1: str(destino)}
+    original_caminho = rawclone.caminho_disco
+    original_escrever = DispositivoBruto.escrever_de
+    chamadas = {"n": 0}
+
+    def escrever_curto(self, buffer, tamanho):
+        chamadas["n"] += 1
+        if chamadas["n"] == 2:
+            return tamanho - SETOR  # o disco aceitou menos do que o pedido
+        return original_escrever(self, buffer, tamanho)
+
+    rawclone.caminho_disco = lambda n: caminhos[n]
+    DispositivoBruto.escrever_de = escrever_curto
+    try:
+        try:
+            rawclone.executar_clone(plano, registrar=lambda *_: None, arquivo_estado=estado)
+            checar(False, "deveria levantar ErroClone")
+        except ErroClone as exc:
+            checar("incompleta" in str(exc), "gravacao parcial levanta ErroClone")
+        checar(
+            json.loads(estado.read_text(encoding="utf-8"))["offset"] == bloco,
+            "retomada volta ao bloco que falhou, nao ao seguinte",
+        )
+    finally:
+        rawclone.caminho_disco = original_caminho
+        DispositivoBruto.escrever_de = original_escrever
+
+
+def teste_assinatura_da_retomada(tmp: Path) -> None:
+    print("\n21. Assinatura da retomada distingue discos do mesmo modelo")
+    import json
+    from dataclasses import replace
+
+    from copiahd.disks import Particao
+    from copiahd.rawclone import EstadoRetomada, PlanoClone, assinatura_clone
+
+    def plano(o, d):
+        return PlanoClone(o, d, 1000 * SETOR, SETOR, SETOR, "completo")
+
+    # dois discos do mesmo modelo, sem numero de serie
+    o = replace(_disco_falso(0), serial=None, modelo="MESMO-MODELO", tamanho=1000 * SETOR)
+    d = replace(_disco_falso(1), serial=None, modelo="MESMO-MODELO", tamanho=2000 * SETOR)
+    base = assinatura_clone(plano(o, d))
+    checar(json.loads(json.dumps(base)) == base, "assinatura sobrevive ao ciclo JSON sem mudar")
+    checar(assinatura_clone(plano(replace(o, tamanho=999 * SETOR), d)) != base, "tamanho da origem diferente muda a assinatura")
+    checar(assinatura_clone(plano(o, replace(d, tamanho=3000 * SETOR))) != base, "tamanho do destino diferente muda a assinatura")
+    camada = Particao(1, 1 << 20, 1 << 25, "Basic", None, None, "NTFS", None, None)
+    checar(assinatura_clone(plano(replace(o, particoes=[camada]), d)) != base, "layout de particoes da origem diferente muda a assinatura")
+    checar(
+        assinatura_clone(plano(o, replace(d, particoes=[camada]))) == base,
+        "layout do destino fica fora (a copia parcial o altera; a retomada precisa reconhecer)",
+    )
+
+    est = EstadoRetomada(tmp / "ass.json")
+    est.salvar(base, 4096, [])
+    checar(EstadoRetomada(tmp / "ass.json").carregar(base) == 4096, "mesma assinatura: retoma do offset salvo")
+    outro = assinatura_clone(plano(replace(o, tamanho=999 * SETOR), d))
+    checar(EstadoRetomada(tmp / "ass.json").carregar(outro) == 0, "assinatura diferente: recomeca do zero")
+
+
 def teste_arredondamento(_tmp: Path) -> None:
     print("\n8. Arredondamento de tamanhos para multiplo de setor")
     checar(_arredondar_para_cima(1, 512) == 512, "1 B -> 512 B")
@@ -854,6 +1032,11 @@ def main() -> int:
             teste_travas_do_destino,
             teste_estado_salvo_em_erro,
             teste_opcao_offline_destino,
+            teste_modo_arquivos_recusa_origem_mbr,
+            teste_ignorar_espaco_separado_de_sim,
+            teste_gpt_mantem_lba_das_entradas,
+            teste_gravacao_incompleta,
+            teste_assinatura_da_retomada,
             teste_arredondamento,
         ):
             teste(tmp)

@@ -215,6 +215,26 @@ class EstadoRetomada:
         self.caminho.unlink(missing_ok=True)
 
 
+def assinatura_clone(plano: PlanoClone) -> dict:
+    """Identifica o par origem/destino de um clone para validar a retomada.
+
+    So `serial or modelo` confundia dois discos do mesmo modelo sem numero de
+    serie. Soma o tamanho dos dois e o layout de particoes da origem (somente
+    leitura, estavel). O layout do destino fica de fora de proposito: a copia
+    parcial ja o altera, e a retomada nao poderia mais reconhecer o disco.
+    So listas e numeros, para sobreviver ao ciclo JSON sem mudar de valor.
+    """
+    o, d = plano.origem, plano.destino
+    return {
+        "origem": o.serial or o.modelo,
+        "origem_tamanho": o.tamanho,
+        "origem_particoes": [[p.offset, p.tamanho] for p in o.particoes],
+        "destino": d.serial or d.modelo,
+        "destino_tamanho": d.tamanho,
+        "bytes": plano.bytes_a_copiar,
+    }
+
+
 def preparar_destino(numero_disco: int, registrar=print) -> list[DispositivoBruto]:
     """Desmonta e tranca os volumes do destino antes de sobrescrever.
 
@@ -257,11 +277,7 @@ def executar_clone(
     retomar: bool = True,
 ) -> Progresso:
     """Copia os bytes da origem para o destino, bloco por bloco."""
-    assinatura = {
-        "origem": plano.origem.serial or plano.origem.modelo,
-        "destino": plano.destino.serial or plano.destino.modelo,
-        "bytes": plano.bytes_a_copiar,
-    }
+    assinatura = assinatura_clone(plano)
     estado = EstadoRetomada(arquivo_estado) if arquivo_estado else None
     inicio_offset = estado.carregar(assinatura) if (estado and retomar) else 0
     if inicio_offset:
@@ -290,7 +306,13 @@ def executar_clone(
                 )
                 progresso.bytes_zerados += zerados
                 destino.posicionar(offset)
-                destino.escrever_de(buffer, tamanho)
+                escritos = destino.escrever_de(buffer, tamanho)
+                if escritos != tamanho:
+                    raise ErroClone(
+                        f"Gravacao incompleta no offset {offset}: {escritos} de {tamanho} "
+                        "bytes. O progresso foi salvo; corrija a causa (cabo, USB, disco com "
+                        "defeito) e rode o mesmo comando para retomar."
+                    )
 
                 offset += tamanho
                 progresso.copiados = min(offset, plano.bytes_a_copiar)

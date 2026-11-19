@@ -24,6 +24,7 @@ from .fileclone import (
     copiar_volume,
     particionar_destino,
     reconstruir_boot,
+    validar_origem_uefi,
 )
 from .postclone import (
     ajustar_gpt_destino,
@@ -273,14 +274,18 @@ def comando_arquivos(args) -> int:
         registrar(f"Copia_hd {VERSAO} - copia por arquivos (destino menor)")
         registrar(f"Origem : {origem.resumo().strip()}")
         registrar(f"Destino: {destino.resumo().strip()}")
+        validar_origem_uefi(origem)
 
         if destino.tem_sistema or destino.tem_boot:
             registrar("ERRO: o destino e o disco de sistema em uso.")
             return 1
         couber, detalhe = cabe_no_destino(origem, destino)
         registrar(f"  {detalhe}")
-        if not couber and not args.sim:
-            registrar("ERRO: destino pequeno demais para os dados da origem.")
+        if not couber and not args.ignorar_espaco:
+            registrar(
+                "ERRO: destino pequeno demais para os dados da origem. "
+                "(--ignorar-espaco segue mesmo assim, por sua conta e risco.)"
+            )
             return 1
 
         volume_origem = args.volume_origem or _maior_volume(origem)
@@ -409,6 +414,7 @@ def menu_interativo() -> int:
             chkdsk=False,
             amostras=64,
             volume_origem=None,
+            ignorar_espaco=False,
             letra_windows="W",
             letra_efi="S",
         )
@@ -481,7 +487,12 @@ def construir_parser() -> argparse.ArgumentParser:
     a.add_argument("--letra-windows", default="W", help="letra temporaria do Windows no destino")
     a.add_argument("--letra-efi", default="S", help="letra temporaria da particao EFI no destino")
     a.add_argument("--simular", action="store_true")
-    a.add_argument("--sim", action="store_true")
+    a.add_argument("--sim", action="store_true", help="dispensa a confirmacao digitada")
+    a.add_argument(
+        "--ignorar-espaco",
+        action="store_true",
+        help="segue mesmo que a checagem indique destino pequeno demais",
+    )
     a.set_defaults(func=comando_arquivos)
 
     j = sub.add_parser("ajustar", help="corrige GPT e expande a particao de um HD ja clonado")

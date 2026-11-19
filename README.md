@@ -83,6 +83,14 @@ junctions (`/SJ`).
 Exclui o que o Windows recria sozinho: `pagefile.sys`, `swapfile.sys`,
 `hiberfil.sys`, `$RECYCLE.BIN`, `System Volume Information`.
 
+**Só para origem GPT/UEFI.** Este modo sempre cria o destino em GPT com partição EFI
+e reconstrói o boot com `bcdboot /f UEFI`. Se a origem for MBR/BIOS, o comando
+recusa **antes de apagar o destino** e indica o clone setor a setor, que preserva
+o formato original.
+
+`--sim` só dispensa a confirmação digitada. Para seguir mesmo quando a checagem
+indicar destino pequeno demais, use `--ignorar-espaco`.
+
 **Limitação importante:** arquivos abertos pelo Windows em execução não são
 copiados. Rode este modo a partir de um Windows PE, com os dois discos como
 secundários, para que o resultado seja confiável.
@@ -120,7 +128,7 @@ e recrie a recuperação com `reagentc /enable`.
 python -m tests.test_copiahd
 ```
 
-86 verificações sobre imagens de disco sintéticas — GPT construída à mão, volume
+105 verificações sobre imagens de disco sintéticas — GPT construída à mão, volume
 FAT32 com nomes longos, simulação de setor defeituoso. Nenhum disco real é tocado.
 
 ## Estrutura

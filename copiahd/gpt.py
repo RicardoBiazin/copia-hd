@@ -197,7 +197,7 @@ def corrigir_gpt(
             cab,
             minha_lba=1,
             lba_alternativa=ultima_lba,
-            lba_entradas=2,
+            lba_entradas=cab.lba_entradas,  # as entradas primarias nao sao movidas
             primeira_usavel=cab.primeira_lba_usavel,
             ultima_usavel=nova_ultima_usavel,
             guid_disco=guid_disco,
